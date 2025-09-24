@@ -2,16 +2,13 @@ import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
-import io
-import base64
-from ultralytics import YOLO
 import pandas as pd
 from collections import Counter
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
-import tempfile
-import os
+import requests
+from io import BytesIO
 
 # Page config with jazzy theme
 st.set_page_config(
@@ -66,11 +63,6 @@ st.markdown("""
         transform: translateY(-2px);
         box-shadow: 0 5px 15px rgba(0,0,0,0.2);
     }
-    
-    .sidebar .stSelectbox > div > div {
-        background: linear-gradient(135deg, #667eea, #764ba2);
-        color: white;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -78,83 +70,72 @@ st.markdown("""
 if 'detection_history' not in st.session_state:
     st.session_state.detection_history = []
 
-@st.cache_resource
-def load_model():
-    """Load YOLO model"""
-    try:
-        model = YOLO('yolov8n.pt')  # Using nano model for faster inference
-        return model
-    except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        return None
-
-def detect_objects(image, model, confidence_threshold=0.5):
-    """Perform object detection on image"""
-    if model is None:
-        return None, {}
+def detect_objects_opencv(image):
+    """Basic object detection using OpenCV classical methods"""
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     
-    results = model(image, conf=confidence_threshold)
+    # Use Haar cascades for face detection (built into OpenCV)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
     
-    # Extract detection info
-    detections = {}
+    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+    eyes = eye_cascade.detectMultiScale(gray, 1.1, 4)
+    
+    # Edge detection for general objects
+    edges = cv2.Canny(gray, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
     annotated_image = image.copy()
+    detections = {}
     
-    if len(results) > 0:
-        boxes = results[0].boxes
-        if boxes is not None:
-            for box in boxes:
-                # Get class name
-                class_id = int(box.cls[0])
-                class_name = model.names[class_id]
-                confidence = float(box.conf[0])
-                
-                # Count detections
-                if class_name in detections:
-                    detections[class_name] += 1
-                else:
-                    detections[class_name] = 1
-                
-                # Draw bounding box
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                
-                # Add label
-                label = f"{class_name}: {confidence:.2f}"
-                cv2.putText(annotated_image, label, (x1, y1-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+    # Draw face rectangles
+    for (x, y, w, h) in faces:
+        cv2.rectangle(annotated_image, (x, y), (x+w, y+h), (255, 0, 0), 2)
+        cv2.putText(annotated_image, 'Face', (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    
+    # Draw eye rectangles
+    for (x, y, w, h) in eyes:
+        cv2.rectangle(annotated_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(annotated_image, 'Eye', (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    
+    # Count large contours as objects
+    large_objects = 0
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area > 1000:  # Filter small contours
+            large_objects += 1
+            x, y, w, h = cv2.boundingRect(contour)
+            cv2.rectangle(annotated_image, (x, y), (x+w, y+h), (0, 0, 255), 1)
+    
+    # Create detection summary
+    if len(faces) > 0:
+        detections['Faces'] = len(faces)
+    if len(eyes) > 0:
+        detections['Eyes'] = len(eyes)
+    if large_objects > 0:
+        detections['Objects'] = large_objects
     
     return annotated_image, detections
 
-def count_people(image, model):
-    """Count people in image"""
-    if model is None:
-        return 0, image
+def count_people_basic(image):
+    """Count people using basic face detection"""
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     
-    results = model(image, classes=[0])  # Class 0 is 'person' in COCO dataset
+    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
     annotated_image = image.copy()
-    people_count = 0
     
-    if len(results) > 0:
-        boxes = results[0].boxes
-        if boxes is not None:
-            people_count = len(boxes)
-            
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                confidence = float(box.conf[0])
-                
-                # Draw bounding box for people
-                cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(annotated_image, f"Person: {confidence:.2f}", 
-                           (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    for (x, y, w, h) in faces:
+        cv2.rectangle(annotated_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(annotated_image, f'Person {len(faces)}', (x, y-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
-    return people_count, annotated_image
+    return len(faces), annotated_image
 
 def detect_text_regions(image):
     """Detect text regions using OpenCV"""
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     
-    # Use EAST text detector approach (simplified)
     # Apply morphological operations to find text regions
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
     dilated = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel)
@@ -174,16 +155,41 @@ def detect_text_regions(image):
             # Filter based on text-like properties
             if 0.2 < aspect_ratio < 10:
                 cv2.rectangle(annotated_image, (x, y), (x + w, y + h), (255, 255, 0), 2)
+                cv2.putText(annotated_image, 'Text', (x, y-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
                 text_regions += 1
     
     return text_regions, annotated_image
+
+def analyze_image_properties(image):
+    """Analyze basic image properties"""
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    
+    # Calculate basic statistics
+    mean_brightness = np.mean(gray)
+    contrast = np.std(gray)
+    
+    # Edge density
+    edges = cv2.Canny(gray, 50, 150)
+    edge_density = np.sum(edges > 0) / (edges.shape[0] * edges.shape[1])
+    
+    # Color analysis
+    colors = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    dominant_hue = np.median(colors[:, :, 0])
+    
+    return {
+        'brightness': mean_brightness,
+        'contrast': contrast,
+        'edge_density': edge_density * 100,
+        'dominant_hue': dominant_hue
+    }
 
 def main():
     # Header
     st.markdown("""
     <div class="main-header">
         <h1>🎯 VisionPro AI</h1>
-        <p>Advanced Computer Vision for Daily Tasks</p>
+        <p>Computer Vision for Daily Tasks - Streamlit Cloud Edition</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -192,17 +198,13 @@ def main():
     app_mode = st.sidebar.selectbox(
         "Choose Application Mode",
         ["🔍 Object Detection", "📊 Inventory Counter", "👥 People Counter", 
-         "📝 Text Detection", "📈 Analytics Dashboard"]
+         "📝 Text Detection", "🎨 Image Analysis", "📈 Analytics Dashboard"]
     )
     
-    # Load model
-    model = load_model()
-    
     if app_mode == "🔍 Object Detection":
-        st.markdown('<div class="feature-card"><h2>🔍 Object Detection</h2><p>Detect and identify objects in images using state-of-the-art AI</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="feature-card"><h2>🔍 Object Detection</h2><p>Detect faces, eyes, and objects using OpenCV</p></div>', unsafe_allow_html=True)
         
         uploaded_file = st.file_uploader("Upload an image", type=['jpg', 'jpeg', 'png'])
-        confidence = st.slider("Confidence Threshold", 0.1, 1.0, 0.5, 0.1)
         
         if uploaded_file is not None:
             image = Image.open(uploaded_file)
@@ -217,31 +219,32 @@ def main():
             with col2:
                 st.subheader("Detected Objects")
                 with st.spinner("Analyzing image..."):
-                    annotated_image, detections = detect_objects(image_np, model, confidence)
+                    annotated_image, detections = detect_objects_opencv(image_np)
                     
-                if annotated_image is not None:
-                    st.image(annotated_image, use_column_width=True)
+                st.image(annotated_image, use_column_width=True)
+                
+                if detections:
+                    st.subheader("Detection Results")
+                    for obj, count in detections.items():
+                        st.markdown(f"""
+                        <div class="metric-card">
+                            <h3>{obj}</h3>
+                            <h2>{count}</h2>
+                        </div>
+                        """, unsafe_allow_html=True)
                     
-                    if detections:
-                        st.subheader("Detection Results")
-                        for obj, count in detections.items():
-                            st.markdown(f"""
-                            <div class="metric-card">
-                                <h3>{obj}</h3>
-                                <h2>{count}</h2>
-                            </div>
-                            """, unsafe_allow_html=True)
-                        
-                        # Save to history
-                        detection_entry = {
-                            'timestamp': datetime.now(),
-                            'detections': detections,
-                            'total_objects': sum(detections.values())
-                        }
-                        st.session_state.detection_history.append(detection_entry)
+                    # Save to history
+                    detection_entry = {
+                        'timestamp': datetime.now(),
+                        'detections': detections,
+                        'total_objects': sum(detections.values())
+                    }
+                    st.session_state.detection_history.append(detection_entry)
+                else:
+                    st.info("No objects detected with current methods. Try an image with faces or clear objects.")
     
     elif app_mode == "📊 Inventory Counter":
-        st.markdown('<div class="feature-card"><h2>📊 Inventory Counter</h2><p>Count and track inventory items automatically</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="feature-card"><h2>📊 Inventory Counter</h2><p>Count items using contour detection</p></div>', unsafe_allow_html=True)
         
         uploaded_file = st.file_uploader("Upload inventory image", type=['jpg', 'jpeg', 'png'])
         
@@ -256,31 +259,48 @@ def main():
                 st.image(image, use_column_width=True)
             
             with col2:
-                st.subheader("Inventory Count")
+                st.subheader("Item Count")
                 with st.spinner("Counting items..."):
-                    annotated_image, detections = detect_objects(image_np, model, 0.5)
+                    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+                    edges = cv2.Canny(gray, 50, 150)
+                    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    # Filter contours by size
+                    items = []
+                    annotated_image = image_np.copy()
+                    
+                    for i, contour in enumerate(contours):
+                        area = cv2.contourArea(contour)
+                        if 500 < area < 50000:  # Filter reasonable item sizes
+                            items.append(area)
+                            x, y, w, h = cv2.boundingRect(contour)
+                            cv2.rectangle(annotated_image, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                            cv2.putText(annotated_image, f'Item {len(items)}', (x, y-10), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
                 
-                if detections:
-                    # Create inventory summary
-                    inventory_df = pd.DataFrame([
-                        {'Item': item, 'Count': count, 'Category': 'General'}
-                        for item, count in detections.items()
-                    ])
+                st.image(annotated_image, use_column_width=True)
+                
+                # Create inventory summary
+                if items:
+                    inventory_df = pd.DataFrame({
+                        'Item': [f'Item {i+1}' for i in range(len(items))],
+                        'Size': items,
+                        'Category': ['Detected Object'] * len(items)
+                    })
                     
                     st.dataframe(inventory_df, use_container_width=True)
                     
-                    # Pie chart
-                    fig = px.pie(inventory_df, values='Count', names='Item', 
-                                title="Inventory Distribution")
+                    # Size distribution chart
+                    fig = px.histogram(inventory_df, x='Size', title="Item Size Distribution")
                     fig.update_layout(template="plotly_white")
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    # Total count
-                    total_items = sum(detections.values())
-                    st.metric("Total Items", total_items)
+                    st.metric("Total Items Detected", len(items))
+                else:
+                    st.info("No items detected. Try adjusting the image or using items with clear boundaries.")
     
     elif app_mode == "👥 People Counter":
-        st.markdown('<div class="feature-card"><h2>👥 People Counter</h2><p>Count people in images for crowd monitoring</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="feature-card"><h2>👥 People Counter</h2><p>Count people using face detection</p></div>', unsafe_allow_html=True)
         
         uploaded_file = st.file_uploader("Upload image with people", type=['jpg', 'jpeg', 'png'])
         
@@ -297,7 +317,7 @@ def main():
             with col2:
                 st.subheader("People Detection")
                 with st.spinner("Counting people..."):
-                    people_count, annotated_image = count_people(image_np, model)
+                    people_count, annotated_image = count_people_basic(image_np)
                 
                 st.image(annotated_image, use_column_width=True)
                 
@@ -307,9 +327,12 @@ def main():
                     <h2>{people_count}</h2>
                 </div>
                 """, unsafe_allow_html=True)
+                
+                if people_count == 0:
+                    st.info("No faces detected. This method works best with clear, front-facing photos.")
     
     elif app_mode == "📝 Text Detection":
-        st.markdown('<div class="feature-card"><h2>📝 Text Detection</h2><p>Detect text regions in images</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="feature-card"><h2>📝 Text Detection</h2><p>Detect text regions using morphological operations</p></div>', unsafe_allow_html=True)
         
         uploaded_file = st.file_uploader("Upload image with text", type=['jpg', 'jpeg', 'png'])
         
@@ -336,6 +359,50 @@ def main():
                     <h2>{text_count}</h2>
                 </div>
                 """, unsafe_allow_html=True)
+    
+    elif app_mode == "🎨 Image Analysis":
+        st.markdown('<div class="feature-card"><h2>🎨 Image Analysis</h2><p>Analyze image properties and characteristics</p></div>', unsafe_allow_html=True)
+        
+        uploaded_file = st.file_uploader("Upload image for analysis", type=['jpg', 'jpeg', 'png'])
+        
+        if uploaded_file is not None:
+            image = Image.open(uploaded_file)
+            image_np = np.array(image)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("Original Image")
+                st.image(image, use_column_width=True)
+                
+                # Basic image info
+                st.write(f"**Dimensions:** {image_np.shape[1]} x {image_np.shape[0]}")
+                st.write(f"**Channels:** {image_np.shape[2] if len(image_np.shape) > 2 else 1}")
+            
+            with col2:
+                st.subheader("Analysis Results")
+                with st.spinner("Analyzing image properties..."):
+                    props = analyze_image_properties(image_np)
+                
+                col2a, col2b = st.columns(2)
+                
+                with col2a:
+                    st.metric("Brightness", f"{props['brightness']:.1f}")
+                    st.metric("Contrast", f"{props['contrast']:.1f}")
+                
+                with col2b:
+                    st.metric("Edge Density", f"{props['edge_density']:.1f}%")
+                    st.metric("Dominant Hue", f"{props['dominant_hue']:.0f}°")
+                
+                # Color histogram
+                fig = go.Figure()
+                for i, color in enumerate(['red', 'green', 'blue']):
+                    hist = np.histogram(image_np[:,:,i], bins=50, range=(0, 255))[0]
+                    fig.add_trace(go.Scatter(y=hist, name=color.upper(), 
+                                           line=dict(color=color)))
+                
+                fig.update_layout(title="Color Distribution", template="plotly_white")
+                st.plotly_chart(fig, use_container_width=True)
     
     elif app_mode == "📈 Analytics Dashboard":
         st.markdown('<div class="feature-card"><h2>📈 Analytics Dashboard</h2><p>View detection history and analytics</p></div>', unsafe_allow_html=True)
@@ -392,7 +459,15 @@ def main():
         if st.button("Clear History"):
             st.session_state.detection_history = []
             st.success("History cleared!")
-            st.experimental_rerun()
+            st.rerun()
+
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+    <div style="text-align: center; color: #666;">
+        <p>🎯 VisionPro AI - Streamlit Cloud Edition | Built with OpenCV & Streamlit</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
